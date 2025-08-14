@@ -1,0 +1,1701 @@
+<!doctype html>
+
+<html lang="en">
+
+<head>
+
+<meta charset="utf-8" />
+
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+<title>HeliFire v7.0 — firebeam + explosive houses + foam + smokejumper + threat indicators</title>
+
+<style>
+
+  html, body { height: 100%; margin: 0; background: #0b0f12; color: #e7ebef; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+
+  #ui { position: fixed; inset: 0; pointer-events: none; }
+
+  #help { position: fixed; left: 12px; bottom: 12px; background: rgba(15,20,25,.7); border: 1px solid rgba(255,255,255,.1); border-radius: 10px; padding: 8px 10px; backdrop-filter: blur(6px); font-size: 12px; line-height: 1.3; }
+
+  #help kbd { background: #11161a; padding: 2px 5px; border-radius: 6px; border: 1px solid #2a3239; font-size: 12px; }
+
+  #msg { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); background: rgba(15,20,25,.7); border: 1px solid rgba(255,255,255,.1); border-radius: 10px; padding: 8px 10px; backdrop-filter: blur(6px); font-size: 13px; }
+
+  canvas { display: block; width: 100vw; height: 100vh; }
+
+
+
+  /* start menu (non-conflicting styles; visibility controlled by JS) */
+
+  #menu h1 { font-size: 48px; font-weight: 600; letter-spacing: 1px; margin: 0 0 20px 0; text-shadow: 0 0 10px rgba(0,0,0,0.5); }
+
+  #menu .options { margin-bottom: 24px; }
+
+  #menu label { font-size: 14px; margin-right: 8px; }
+
+  #menu select { background: #11161a; color: #e7ebef; border: 1px solid #2a3239; border-radius: 6px; padding: 4px 8px; }
+
+  #menu button { background: #89b0ff; color: #0b0f12; border: none; border-radius: 10px; padding: 12px 24px; font-size: 18px; font-weight: 500; cursor: pointer; transition: transform 0.1s ease; }
+
+  #menu button:hover { transform: scale(1.05); }
+
+</style>
+
+</head>
+
+<body>
+
+<canvas id="game"></canvas>
+
+<div id="ui">
+
+  <div id="msg"></div>
+
+  <div id="help">
+
+    fly - <kbd>WASD</kbd> or <kbd>arrows</kbd><br>
+
+    hose - hold <kbd>space</kbd><br>
+
+    boost - hold <kbd>shift</kbd> (unlocks after 2 saves or at level 2; drains stamina)<br>
+
+    reinforcements - <kbd>E</kbd> (cooldown, unlock by level 2)<br>
+
+    rain cloud - <kbd>Q</kbd> (10s AoE x3, unlock by level 3)<br>
+
+    smokejumper - <kbd>C</kbd> (toggle targeting, click a house) — unlocks by level 2<br>
+
+    restart - <kbd>R</kbd> · pause - <kbd>P</kbd>
+
+  </div>
+
+  <div id="menu">
+
+    <h1>HeliFire</h1>
+
+    <div class="options">
+
+      <label for="difficulty">Difficulty:</label>
+
+      <select id="difficulty">
+
+        <option value="easy">Easy</option>
+
+        <option value="normal" selected>Normal</option>
+
+        <option value="hard">Hard</option>
+
+      </select>
+
+    </div>
+
+    <button id="startBtn">Start Game</button>
+
+  </div>
+
+</div>
+
+<script>
+
+(() => {
+
+  'use strict';
+
+
+
+  // Canvas setup with high-DPI support
+
+  const canvas = document.getElementById('game');
+
+  const ctx = canvas.getContext('2d');
+
+  const msgEl = document.getElementById('msg');
+
+  const uiEl = document.getElementById('ui');
+
+  const menuEl = document.getElementById('menu');
+
+  const startBtn = document.getElementById('startBtn');
+
+  const difficultySelect = document.getElementById('difficulty');
+
+  let DPR = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+
+  let state = null; // declared before any reference
+
+
+
+  function resize() {
+
+    DPR = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+
+    canvas.width = Math.floor(window.innerWidth * DPR);
+
+    canvas.height = Math.floor(window.innerHeight * DPR);
+
+    if (state) centerCamera();
+
+  }
+
+  window.addEventListener('resize', resize);
+
+  resize();
+
+
+
+  // World settings
+
+  const WORLD = { w: 2400, h: 1800 };
+
+  const RNG = mulberry32(Math.floor(Math.random()*1e9));
+
+
+
+  // ---------- robust input ----------
+
+  const pressed = Object.create(null);
+
+  const BLOCK_CODES = new Set(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space','KeyW','KeyA','KeyS','KeyD','KeyP','KeyR','ShiftLeft','ShiftRight','KeyQ','KeyE','KeyC']);
+
+  function isDown(code){ return !!pressed[code]; }
+
+  function clearAllKeys(){ for (const k in pressed) pressed[k]=false; }
+
+  window.addEventListener('keydown', (e) => { if (BLOCK_CODES.has(e.code)) e.preventDefault(); pressed[e.code] = true; });
+
+  window.addEventListener('keyup',   (e) => { pressed[e.code] = false; });
+
+  window.addEventListener('blur', clearAllKeys);
+
+  document.addEventListener('visibilitychange', ()=>{ if (document.hidden) clearAllKeys(); });
+
+
+
+  // Balance
+
+  const MAX_WATER = 100;          // tank units
+
+  const REFILL_RATE = 60;         // units per second
+
+  const DROP_RATE = 80;           // units per second while holding space
+
+  const BASE_DROP_RADIUS = 80;    // px
+
+  const FIRE_GROWTH = 1.6;        // per second up to 100
+
+  const WATER_EFFECT = 320;       // full tank extinguishes >= 4 typical fires
+
+  const SPREAD_THRESHOLD = 75;    // base threshold for propagation
+
+  const SPREAD_RATE = 0.022;      // base spread chance (used for non-beam events like explosions)
+
+  const MAX_LOSSES = 6;           // lose if this many houses are destroyed
+
+
+
+  // data-driven water rendering styles
+
+  const WATER_STYLES = {
+
+    lake: { grad: ['#164a6a', '#0f2f45'], stroke: 'rgba(255,255,255,0.08)', lw: 2, inset: 1 },
+
+    pond: { grad: ['#1b5d7c', '#133a51'], stroke: 'rgba(255,255,255,0.08)', lw: 2, inset: 1 },
+
+    pool: { fill: '#2fa7da', stroke: '#8fd9ff', lw: 1.5, inset: 0 }
+
+  };           // lose if this many houses are destroyed
+
+
+
+  const LEVEL_TARGETS = [5,10,15];
+
+
+
+  // player-configurable settings (menu)
+
+  const gameSettings = { difficulty: 'normal' };
+
+
+
+  // Difficulty knobs
+
+  const SPREAD_RATE_L1_MULT = 0.5;  // half spread speed on level 1
+
+  const BOOST_UNLOCK_SAVES = 2;     // unlock boost after this many saves in level 1 (or auto on level 2+)
+
+
+
+  // Upgrades + boost stamina system
+
+  const BOOST_MULT = 2.2;
+
+  const BOOST_STAM_MAX = 100;
+
+  const BOOST_STAM_DRAIN = 25;      // per second while boosting (~4s)
+
+  const BOOST_STAM_REGEN = 16;      // per second when not boosting (~6s)
+
+  const BOOST_LOCK_RECOVERY = 1.0;  // seconds after empty before regen starts
+
+
+
+  // Abilities
+
+  const PLANES_COOLDOWN = 25;             // seconds
+
+  const RAIN_COOLDOWN = 25;               // seconds
+
+  const RAIN_DURATION = 10;               // seconds
+
+  const STRIPE_DURATION = 5;              // seconds persistence of plane water lines
+
+  const STRIPE_WIDTH = 120;               // px width of water stripes
+
+  const SMOKEJUMPER_COOLDOWN = 20;        // seconds
+
+  const SMOKEJUMPER_RATE = 15;            // fire reduced per second
+
+
+
+  // Firebeam seeding timer
+
+  const FIREBEAM_MIN = 12;
+
+  const FIREBEAM_MAX = 20;
+
+
+
+  // Camera
+
+  const camera = { x: 0, y: 0 };
+
+  function centerCamera(){
+
+    if (!state || !canvas) return;
+
+    const maxX = Math.max(0, WORLD.w - canvas.width / DPR);
+
+    const maxY = Math.max(0, WORLD.h - canvas.height / DPR);
+
+    camera.x = clamp(state.heli.x - canvas.width/(2*DPR), 0, maxX);
+
+    camera.y = clamp(state.heli.y - canvas.height/(2*DPR), 0, maxY);
+
+  }
+
+
+
+  // Entities
+
+  class WaterZone { constructor(x,y,w,h,kind){ this.x=x; this.y=y; this.w=w; this.h=h; this.kind=kind; } }
+
+  class Stripe { constructor(orient, pos){ this.orient=orient; this.pos=pos; this.life=STRIPE_DURATION; } }
+
+  class Plane { constructor(orient, pos){ this.orient=orient; this.pos=pos; this.t=0; this.done=false; } }
+
+  class WetZone { constructor(x,y,r){ this.x=x; this.y=y; this.r=r; this.life=1.1; } }
+
+  class House {
+
+    constructor(x,y,w,h, burning){
+
+      this.x=x; this.y=y; this.w=w; this.h=h;
+
+      this.fire = burning? clamp(50 + RNG()*40, 55, 95) : 0;
+
+      this.destroyed = false;
+
+      this.cooldown = 0;
+
+      this.neighbors = [];
+
+      this.wasBurning = this.fire>0;
+
+      this.isSaved=false;
+
+      this.isExplosive = false;
+
+      this.isFirebeamHead = false;
+
+      this.foamTimer = 0;
+
+      this._exploded = false;
+
+    }
+
+    center(){ return {x:this.x+this.w/2, y:this.y+this.h/2}; }
+
+  }
+
+  class Heli { constructor(){ this.x=100; this.y=100; this.vx=0; this.vy=0; this.angle=0; this.rotor=0; this.water=MAX_WATER; } }
+
+  class Smokejumper { constructor(target){ const c = target.center(); this.x=c.x; this.y=c.y; this.target=target; this.done=false; } }
+
+
+
+  // Ash particles (screen space)
+
+  const ash = [];
+
+  function spawnAsh(n){ for(let i=0;i<n;i++){ ash.push({ x: Math.random()*canvas.width, y: Math.random()*canvas.height, vx: 8+Math.random()*20, vy: -4+Math.random()*8, life: 2+Math.random()*3, size: 1+Math.random()*2 }); } }
+
+  spawnAsh(100);
+
+
+
+  function newLevel(level=1, carry={}){
+
+    // Houses first (so we can place pools near them)
+
+    const houses = [];
+
+    const attempts = 420;
+
+    for (let i=0; i<attempts; i++) {
+
+      const w = 70 + RNG()*70; const h = 60 + RNG()*70;
+
+      const x = 200 + RNG()*(WORLD.w-400-w);
+
+      const y = 160 + RNG()*(WORLD.h-320-h);
+
+      if ((Math.floor(x/240)%3===0) || (Math.floor(y/240)%3===0)) continue; // loose street grid
+
+      let overlapped = false;
+
+      for (const hs of houses) { if (rectIntersectsRect(expandRect({x,y,w,h}, 10), expandRect(hs, 10))) { overlapped = true; break; } }
+
+      if (!overlapped) houses.push(new House(x,y,w,h,false));
+
+    }
+
+
+
+    // Water zones: one main lake, some ponds, and backyard pools
+
+    const waterZones = [];
+
+    const lake = new WaterZone(120, WORLD.h-420, 520, 360, 'lake');
+
+    waterZones.push(lake);
+
+
+
+    const anyOverlap = (rect) => {
+
+      if (rectIntersectsRect(rect, expandRect(lake, 20))) return true;
+
+      for (const wz of waterZones) if (rectIntersectsRect(rect, expandRect(wz, 6))) return true;
+
+      for (const hs of houses) if (rectIntersectsRect(rect, expandRect(hs, 4))) return true;
+
+      return false;
+
+    };
+
+
+
+    // natural ponds (4–6)
+
+    const pondCount = 4 + Math.floor(RNG()*3);
+
+    for (let i=0; i<pondCount; i++){
+
+      for (let t=0; t<80; t++){
+
+        const w = 140 + RNG()*120, h = 100 + RNG()*100;
+
+        const x = 160 + RNG()*(WORLD.w-320-w);
+
+        const y = 140 + RNG()*(WORLD.h-280-h);
+
+        const r = {x,y,w,h};
+
+        if ((Math.floor(x/240)%3===0) || (Math.floor(y/240)%3===0)) continue; // avoid roads
+
+        if (!anyOverlap(expandRect(r, 6))) { waterZones.push(new WaterZone(x,y,w,h,'pond')); break; }
+
+      }
+
+    }
+
+
+
+    // backyard pools (12–18) placed adjacent to random houses
+
+    const poolTargets = houses.slice(); shuffleInPlace(poolTargets, RNG);
+
+    const limit = 14 + Math.floor(RNG()*5);
+
+    for (const hs of poolTargets.slice(0, limit)){
+
+      for (let tries=0; tries<10; tries++){
+
+        const pw = 28 + RNG()*26, ph = 16 + RNG()*18;
+
+        const side = Math.floor(RNG()*4); // 0 top,1 right,2 bottom,3 left
+
+        const gap = 10 + RNG()*14;
+
+        let x, y;
+
+        if (side===0){ x = hs.x + 6 + RNG()*(hs.w - pw - 12); y = hs.y - gap - ph; }
+
+        else if (side===1){ x = hs.x + hs.w + gap; y = hs.y + 6 + RNG()*(hs.h - ph - 12); }
+
+        else if (side===2){ x = hs.x + 6 + RNG()*(hs.w - pw - 12); y = hs.y + hs.h + gap; }
+
+        else { x = hs.x - gap - pw; y = hs.y + 6 + RNG()*(hs.h - ph - 12); }
+
+        const r = {x,y,w:pw,h:ph};
+
+        if (x<40 || y<40 || x+pw>WORLD.w-40 || y+ph>WORLD.h-40) continue;
+
+        if ((Math.floor(x/240)%3===0) || (Math.floor(y/240)%3===0)) continue; // don't drop on road lines
+
+        if (!anyOverlap(expandRect(r, 4))) { waterZones.push(new WaterZone(x,y,pw,ph,'pool')); break; }
+
+      }
+
+    }
+
+
+
+    // Seed some fires
+
+    shuffleInPlace(houses, RNG);
+
+    const initialFires = Math.max(8, Math.floor(houses.length*0.12));
+
+    for (let i=0; i<initialFires && i<houses.length; i++) {
+
+      houses[i].fire = clamp(55 + RNG()*40, 55, 95);
+
+      houses[i].isFirebeamHead = true; // start beams here
+
+      houses[i].wasBurning = true;      // ensure saved counter works for instant extinguish
+
+    }
+
+
+
+    // neighbor links for spread
+
+    for (let i=0; i<houses.length; i++) {
+
+      const a = houses[i];
+
+      for (let j=i+1; j<houses.length; j++) {
+
+        const b = houses[j];
+
+        const ax=a.x+a.w/2, ay=a.y+a.h/2, bx=b.x+b.w/2, by=b.y+b.h/2;
+
+        const d2=(ax-bx)*(ax-bx)+(ay-by)*(ay-by);
+
+        if (d2 < 260*260) { a.neighbors.push(b); b.neighbors.push(a); }
+
+      }
+
+    }
+
+
+
+    // Mark 5% as explosive
+
+    for (const hs of houses){ if (RNG() < 0.05) hs.isExplosive = true; }
+
+
+
+    const heli = new Heli();
+
+    heli.x = WORLD.w*0.5; heli.y = WORLD.h*0.5;
+
+
+
+    const prev = state || {};
+
+    state = {
+
+      // world
+
+      waterZones, houses, heli,
+
+      // session
+
+      time:0, gameState:'menu', won:false, lost:false,
+
+      // campaign
+
+      level: level, savedThisLevel: 0, target: LEVEL_TARGETS[level-1]||LEVEL_TARGETS[LEVEL_TARGETS.length-1],
+
+      destroyed:0, saved:0,
+
+      unlocks: {
+
+        boost: carry.boost || prev.unlocks?.boost || (level>1),
+
+        planes: carry.planes || prev.unlocks?.planes || (level>2),
+
+        rain: carry.rain || prev.unlocks?.rain || false,
+
+        foamAdditive: carry.foamAdditive || prev.unlocks?.foamAdditive || (level>1),
+
+        smokejumpers: carry.smokejumpers || prev.unlocks?.smokejumpers || (level>1)
+
+      },
+
+      // abilities state
+
+      planesCd: 0, rainCd: 0, rainTime: 0,
+
+      stripes: [], planes: [], wetZones: [],
+
+      // smokejumpers
+
+      smokejumpers: [], smokejumperCd: 0, smokejumperTargeting: false,
+
+      // boost stamina state
+
+      boostStam: (carry.boostStam ?? (prev.boostStam ?? BOOST_STAM_MAX)),
+
+      boostLock: false, boostLockTimer: 0,
+
+      // input latches (edge triggers)
+
+      _planesLatch: false, _rainLatch: false, _smokeLatch: false,
+
+      // delayed second wave for planes (pause-safe)
+
+      planesPhase: null,
+
+      // difficulty per level
+
+      spreadRate: (level===1? SPREAD_RATE * SPREAD_RATE_L1_MULT : SPREAD_RATE),
+
+      spreadThreshold: (gameSettings.difficulty==='easy'? 40 : (gameSettings.difficulty==='hard'? 90 : (level===1?50:SPREAD_THRESHOLD))),
+
+      // firebeam seeding timer
+
+      firebeamTimer: (gameSettings.difficulty==='easy'? 25 : FIREBEAM_MIN) + RNG()*(FIREBEAM_MAX - FIREBEAM_MIN),
+
+
+
+      totalSavedAllLevels: carry.totalSavedAllLevels || prev.totalSavedAllLevels || 0,
+
+      scoreboard: null
+
+    };
+
+
+
+    if (!state.unlocks.boost) state.boostStam = 0; // hidden until unlocked
+
+    if (level===3) { state.unlocks.rain = true; }
+
+    centerCamera();
+
+  }
+
+
+
+  function start(){ if (!state) return; state.gameState='playing'; if (menuEl) menuEl.style.display='none'; showMsg(`level ${state.level} — save ${state.target}`); }
+
+
+
+  function nextLevel(){
+
+    const next = state.level + 1;
+
+    if (next>LEVEL_TARGETS.length){
+
+      state.gameState = 'complete'; state.scoreboard = { text: 'campaign complete — press R to restart' };
+
+      showMsg('campaign complete — press R to restart');
+
+      return;
+
+    }
+
+    const carry = {
+
+      boost: state.unlocks.boost,
+
+      planes: state.unlocks.planes || (next>2),
+
+      rain: state.unlocks.rain || (next>3),
+
+      foamAdditive: state.unlocks.foamAdditive,
+
+      smokejumpers: state.unlocks.smokejumpers,
+
+      totalSavedAllLevels: state.totalSavedAllLevels,
+
+      boostStam: state.boostStam
+
+    };
+
+    newLevel(next, carry);
+
+    start();
+
+  }
+
+
+
+  function showMsg(text){ msgEl.textContent = text; clearTimeout(showMsg._t); showMsg._t = setTimeout(()=>{ msgEl.textContent=''; }, 3500); }
+
+
+
+  // Utility functions
+
+  function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+
+  function expandRect(r, m){ return {x:r.x-m, y:r.y-m, w:r.w+2*m, h:r.h+2*m}; }
+
+  function rectIntersectsRect(a,b){ return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y; }
+
+  function circleRectIntersect(cx, cy, r, rx, ry, rw, rh){ const closestX = clamp(cx, rx, rx+rw); const closestY = clamp(cy, ry, ry+rh); const dx = cx - closestX; const dy = cy - closestY; return (dx*dx + dy*dy) <= r*r; }
+
+  function shuffleInPlace(arr, rng){ for (let i=arr.length-1; i>0; i--){ const j=Math.floor(rng()* (i+1)); [arr[i],arr[j]]=[arr[j],arr[i]]; } }
+
+  function mulberry32(a){ return function(){ let t = a += 0x6D2B79F5; t = Math.imul(t ^ t >>> 15, t | 1); t ^= t + Math.imul(t ^ t >>> 7, t | 61); return ((t ^ t >>> 14) >>> 0) / 4294967296; } }
+
+
+
+  // Main loop
+
+  let last = performance.now();
+
+  function tick(now){
+
+    const dt = Math.min(0.033, (now - last) / 1000); // clamp 30 ms
+
+    last = now;
+
+    update(dt);
+
+    render();
+
+    requestAnimationFrame(tick);
+
+  }
+
+
+
+  function update(dt){
+
+    if (!state) { newLevel(1); return; }
+
+    if (!state || state.gameState !== 'playing') return;
+
+
+
+    const prevFires = state.houses.map(h=>h.fire);
+
+
+
+    state.time += dt;
+
+
+
+    // Handle cooldowns
+
+    state.planesCd = Math.max(0, state.planesCd - dt);
+
+    state.rainCd = Math.max(0, state.rainCd - dt);
+
+    state.rainTime = Math.max(0, state.rainTime - dt);
+
+    state.smokejumperCd = Math.max(0, state.smokejumperCd - dt);
+
+
+
+    // Controls
+
+    const heli = state.heli;
+
+    let accel = 420; let maxSpeed = 420; // base
+
+    const fric = 0.92; // velocity damping
+
+
+
+    // Boost stamina logic
+
+    const shiftDown = isDown('ShiftLeft') || isDown('ShiftRight');
+
+    let boostActive = false;
+
+    if (state.unlocks.boost && shiftDown && !state.boostLock && state.boostStam>0){
+
+      boostActive = true;
+
+      accel *= BOOST_MULT; maxSpeed *= BOOST_MULT;
+
+      state.boostStam = Math.max(0, state.boostStam - BOOST_STAM_DRAIN*dt);
+
+      if (state.boostStam===0){ state.boostLock = true; state.boostLockTimer = BOOST_LOCK_RECOVERY; showMsg('boost exhausted'); }
+
+    }
+
+    if (!boostActive){
+
+      if (state.boostLock){
+
+        state.boostLockTimer = Math.max(0, state.boostLockTimer - dt);
+
+        if (state.boostLockTimer===0) state.boostLock = false;
+
+      } else {
+
+        state.boostStam = Math.min(BOOST_STAM_MAX, state.boostStam + BOOST_STAM_REGEN*dt);
+
+      }
+
+    }
+
+
+
+    let ax = (isDown('KeyD') || isDown('ArrowRight') ? 1 : 0) - (isDown('KeyA') || isDown('ArrowLeft') ? 1 : 0);
+
+    let ay = (isDown('KeyS') || isDown('ArrowDown') ? 1 : 0) - (isDown('KeyW') || isDown('ArrowUp') ? 1 : 0);
+
+    ax *= accel; ay *= accel;
+
+    heli.vx += ax*dt; heli.vy += ay*dt;
+
+    const sp = Math.hypot(heli.vx, heli.vy);
+
+    if (sp > maxSpeed) { const k = maxSpeed / sp; heli.vx *= k; heli.vy *= k; }
+
+    heli.x += heli.vx * dt; heli.y += heli.vy * dt;
+
+    heli.vx *= fric; heli.vy *= fric;
+
+
+
+    // Boundaries
+
+    heli.x = clamp(heli.x, 0, WORLD.w);
+
+    heli.y = clamp(heli.y, 0, WORLD.h);
+
+
+
+    // Angle from velocity
+
+    if (sp > 1) heli.angle = Math.atan2(heli.vy, heli.vx);
+
+    heli.rotor += dt * (6 + sp*0.02) * (boostActive?1.2:1);
+
+
+
+    // Refill over any water zone
+
+    for (const z of state.waterZones){
+
+      if (heli.x > z.x && heli.x < z.x+z.w && heli.y > z.y && heli.y < z.y+z.h) {
+
+        const was = heli.water;
+
+        heli.water = clamp(heli.water + REFILL_RATE*dt, 0, MAX_WATER);
+
+        if (heli.water > was && Math.floor(state.time*2)%2===0) showTinyRipple(heli.x, heli.y);
+
+        break;
+
+      }
+
+    }
+
+
+
+    // Edge-triggered activations: E = planes, Q = rain, C = smokejumper targeting
+
+    if (isDown('KeyE')){
+
+      if (!state._planesLatch) { state._planesLatch = true; if (state.unlocks.planes && state.planesCd<=0) activatePlanes(); }
+
+    } else state._planesLatch = false;
+
+
+
+    if (isDown('KeyQ')){
+
+      if (!state._rainLatch) { state._rainLatch = true; if (state.unlocks.rain && state.rainCd<=0){ state.rainTime = RAIN_DURATION; state.rainCd = RAIN_COOLDOWN + RAIN_DURATION; showMsg('rain cloud active'); } }
+
+    } else state._rainLatch = false;
+
+
+
+    if (isDown('KeyC')){
+
+      if (!state._smokeLatch){
+
+        state._smokeLatch = true;
+
+        if (state.unlocks.smokejumpers){
+
+          if (state.smokejumperCd>0){ showMsg(`smokejumper cd ${state.smokejumperCd.toFixed(0)}s`); }
+
+          else { state.smokejumperTargeting = !state.smokejumperTargeting; showMsg(state.smokejumperTargeting? 'click a house for smokejumper' : 'smokejumper canceled'); }
+
+        }
+
+      }
+
+    } else state._smokeLatch = false;
+
+
+
+    // Drop water
+
+    const dropRadius = BASE_DROP_RADIUS * (state.rainTime>0? 3 : 1);
+
+    const dropping = isDown('Space');
+
+    if (dropping && heli.water > 0) {
+
+      const use = Math.min(heli.water, DROP_RATE*dt);
+
+      heli.water -= use;
+
+      const cx = heli.x, cy = heli.y + 10;
+
+      for (const hs of state.houses) {
+
+        if (hs.destroyed || hs.fire <= 0) continue;
+
+        if (circleRectIntersect(cx, cy, dropRadius, hs.x, hs.y, hs.w, hs.h)) {
+
+          hs.fire = Math.max(0, hs.fire - WATER_EFFECT*dt);
+
+          hs.cooldown = 1.2;
+
+          if (state.unlocks.foamAdditive) hs.foamTimer = 15.0;
+
+        }
+
+      }
+
+      state.wetZones.push(new WetZone(cx, cy, dropRadius*0.85));
+
+      for (let i=0;i<2;i++) showSplash(cx + (RNG()*2-1)*12, cy + (RNG()*2-1)*12);
+
+    }
+
+
+
+    // Apply wet zones
+
+    for (let i=state.wetZones.length-1; i>=0; i--){
+
+      const wz = state.wetZones[i];
+
+      wz.life -= dt;
+
+      if (wz.life <= 0) { state.wetZones.splice(i,1); continue; }
+
+      for (const hs of state.houses) {
+
+        if (hs.destroyed || hs.fire <= 0) continue;
+
+        if (circleRectIntersect(wz.x, wz.y, wz.r, hs.x, hs.y, hs.w, hs.h)) {
+
+          hs.fire = Math.max(0, hs.fire - (WATER_EFFECT*0.45)*dt);
+
+          hs.cooldown = 1.2;
+
+        }
+
+      }
+
+    }
+
+
+
+    // Apply plane stripes
+
+    for (let i=state.stripes.length-1; i>=0; i--){
+
+      const s = state.stripes[i]; s.life -= dt; if (s.life<=0){ state.stripes.splice(i,1); continue; }
+
+      for (const hs of state.houses){
+
+        if (hs.destroyed || hs.fire<=0) continue;
+
+        if (s.orient==='v'){
+
+          if (hs.x < s.pos+STRIPE_WIDTH/2 && hs.x+hs.w > s.pos-STRIPE_WIDTH/2) { hs.fire = Math.max(0, hs.fire - (WATER_EFFECT*0.7)*dt); hs.cooldown=1.2; }
+
+        } else {
+
+          if (hs.y < s.pos+STRIPE_WIDTH/2 && hs.y+hs.h > s.pos-STRIPE_WIDTH/2) { hs.fire = Math.max(0, hs.fire - (WATER_EFFECT*0.7)*dt); hs.cooldown=1.2; }
+
+        }
+
+      }
+
+    }
+
+
+
+    // Planes second wave timer (pause-safe)
+
+    if (state.planesPhase){
+
+      state.planesPhase.t -= dt;
+
+      if (state.planesPhase.t <= 0){
+
+        for (const y of state.planesPhase.ys){ state.stripes.push(new Stripe('h', y)); state.planes.push(new Plane('h', y)); }
+
+        state.planesPhase = null; showMsg('air tankers sweep complete');
+
+      }
+
+    }
+
+    // Fire updates & progression
+
+    let saved=0;
+
+    for (const hs of state.houses) {
+
+      if (hs.destroyed) { continue; }
+
+
+
+      // foam decay
+
+      if (hs.foamTimer>0) hs.foamTimer = Math.max(0, hs.foamTimer - dt);
+
+
+
+      if (hs.fire > 0) {
+
+        hs.wasBurning = true;
+
+        const growth = (hs.cooldown>0? FIRE_GROWTH*0.25 : FIRE_GROWTH) * dt;
+
+        hs.fire = clamp(hs.fire + growth, 0, 100);
+
+        if (hs.fire >= 100) {
+
+          hs.destroyed = true;
+
+          // explosive spread on destruction
+
+          if (hs.isExplosive && !hs._exploded){
+
+            hs._exploded = true;
+
+            for (const nb of hs.neighbors){
+
+              if (nb.destroyed || nb.foamTimer>0) continue;
+
+              nb.fire = Math.max(nb.fire, 25);
+
+              nb.wasBurning = true;
+
+              nb.isFirebeamHead = true; // create new beam heads as a crisis
+
+            }
+
+          }
+
+          continue;
+
+        }
+
+        // firebeam propagation
+
+        if (hs.fire > state.spreadThreshold && hs.isFirebeamHead){
+
+          const candidates = hs.neighbors.filter(nb => !nb.destroyed && nb.fire<=5 && nb.foamTimer<=0);
+
+          if (candidates.length>0){
+
+            const nb = candidates[(Math.random()*candidates.length)|0];
+
+            nb.fire = 15; nb.wasBurning = true; nb.isFirebeamHead = true;
+
+            hs.isFirebeamHead = false; // pass the torch
+
+          }
+
+        }
+
+      } else {
+
+        saved++;
+
+      }
+
+      hs.cooldown = Math.max(0, hs.cooldown - dt);
+
+    }
+
+    state.saved = saved; state.destroyed = state.houses.filter(h=>h.destroyed).length;
+
+
+
+    // Periodic new firebeam head
+
+    state.firebeamTimer -= dt;
+
+    if (state.firebeamTimer <= 0){
+
+      const cold = state.houses.filter(h=>!h.destroyed && h.fire<=0 && h.foamTimer<=0);
+
+      if (cold.length>0){
+
+        const h = cold[(Math.random()*cold.length)|0];
+
+        h.fire = 35; h.wasBurning = true; h.isFirebeamHead = true;
+
+      }
+
+      state.firebeamTimer = FIREBEAM_MIN + RNG()*(FIREBEAM_MAX - FIREBEAM_MIN);
+
+    }
+
+
+
+    // Process newly saved house transitions
+
+    processSavedTransitions(prevFires);
+
+
+
+    // Level complete -> new map
+
+    if (state.savedThisLevel >= state.target && !state.attract){ showMsg(`level ${state.level} complete`); nextLevel(); return; }
+
+
+
+    // Lose check
+
+    if (state.destroyed >= MAX_LOSSES && !state.lost) { state.lost = true; state.gameState = 'lost'; showMsg('too many houses lost - press R to retry level'); }
+
+
+
+    // Smokejumpers do work
+
+    for (let i=state.smokejumpers.length-1; i>=0; i--){
+
+      const sj = state.smokejumpers[i];
+
+      if (!sj.target || sj.target.destroyed){ state.smokejumpers.splice(i,1); continue; }
+
+      if (sj.target.fire>0){ sj.target.fire = Math.max(0, sj.target.fire - SMOKEJUMPER_RATE*dt); sj.target.cooldown = 1.0; }
+
+      if (sj.target.fire<=0){ state.smokejumpers.splice(i,1); continue; }
+
+    }
+
+
+
+    // Camera follow
+
+    const lerp = 0.12; // gentle camera ease
+
+    const targetX = clamp(heli.x - canvas.width/(2*DPR), 0, WORLD.w - canvas.width/DPR);
+
+    const targetY = clamp(heli.y - canvas.height/(2*DPR), 0, WORLD.h - canvas.height/DPR);
+
+    camera.x += (targetX - camera.x) * lerp;
+
+    camera.y += (targetY - camera.y) * lerp;
+
+
+
+    // Ash particles (screen space, light overlay)
+
+    stepAsh(dt);
+
+  }
+
+
+
+  function processSavedTransitions(prevFires){
+
+    let gained = 0;
+
+    for (let i=0;i<state.houses.length;i++){
+
+      const hs = state.houses[i];
+
+      if (!hs.destroyed && !hs.isSaved && hs.wasBurning && prevFires[i] > 0 && hs.fire <= 0){
+
+        hs.isSaved = true; gained++; state.totalSavedAllLevels++; state.savedThisLevel++;
+
+        if (!state.unlocks.boost && (state.level>1 || state.savedThisLevel>=BOOST_UNLOCK_SAVES)) { state.unlocks.boost = true; state.boostStam = BOOST_STAM_MAX; showMsg('speed boost unlocked (shift)'); }
+
+      }
+
+    }
+
+    if (gained>0) showMsg(`saved ${state.savedThisLevel}/${state.target}`);
+
+  }
+
+
+
+  function activatePlanes(){
+
+    state.planesCd = PLANES_COOLDOWN + 1.5; // small warmup
+
+    showMsg('reinforcements inbound');
+
+    const xs = [0.2,0.4,0.6,0.8].map(f=>f*WORLD.w);
+
+    const ys = [0.2,0.4,0.6,0.8].map(f=>f*WORLD.h);
+
+    for (const x of xs){ state.stripes.push(new Stripe('v', x)); state.planes.push(new Plane('v', x)); }
+
+    // schedule second wave via game time (pause-safe)
+
+    state.planesPhase = { t: 1.0, ys };
+
+  }
+
+
+
+  // Particles (water & smoke)
+
+  const splashes = []; const ripples = []; const smokes = [];
+
+  function showSplash(x,y){ splashes.push({x,y,r:6,life:0.4}); }
+
+  function showTinyRipple(x,y){ ripples.push({x,y,r:2,life:0.6}); }
+
+  function addSmoke(x,y,s){ smokes.push({x, y, r: 10 + RNG()*8, life: 1.2 + RNG()*1.0, t:0, s}); }
+
+
+
+  function render(){
+
+    if (!state) return;
+
+    const W = canvas.width, H = canvas.height, dpr = DPR;
+
+
+
+    // Clear
+
+    ctx.setTransform(1,0,0,1,0,0);
+
+    ctx.clearRect(0,0,W,H);
+
+
+
+    // World transform
+
+    ctx.setTransform(dpr,0,0,dpr, -camera.x*dpr, -camera.y*dpr);
+
+
+
+    // Ground (green grass)
+
+    drawGround();
+
+
+
+    // Water zones
+
+    for (const z of state.waterZones) drawWater(z);
+
+
+
+    // Plane stripes (effect)
+
+    for (const s of state.stripes) drawStripe(s);
+
+
+
+    // Houses
+
+    for (const hs of state.houses) drawHouse(hs);
+
+
+
+    // Particles under heli
+
+    stepAndDrawSmokes();
+
+
+
+    // Helicopter
+
+    drawHeli(state.heli);
+
+
+
+    // Smokejumpers markers (world space)
+
+    for (const sj of state.smokejumpers){ drawSmokejumper(sj); }
+
+
+
+    // Splash ripples
+
+    stepAndDrawSplashes();
+
+
+
+    // Screen-space overlays below UI
+
+    ctx.setTransform(1,0,0,1,0,0);
+
+    drawThreatIndicator();
+
+
+
+    // UI overlay and ash
+
+    drawUI();
+
+    drawAsh();
+
+    if (state.scoreboard) drawScoreboard(state.scoreboard);
+
+  }
+
+
+
+  function drawGround(){
+
+    // grass tone with subtle squares
+
+    ctx.fillStyle = '#173b1c';
+
+    ctx.fillRect(0,0,WORLD.w, WORLD.h);
+
+    ctx.lineWidth = 1;
+
+    for (let x=0; x<WORLD.w; x+=240) { ctx.strokeStyle = 'rgba(120,180,120,0.06)'; ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,WORLD.h); ctx.stroke(); }
+
+    for (let y=0; y<WORLD.h; y+=240) { ctx.strokeStyle = 'rgba(120,180,120,0.06)'; ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(WORLD.w,y); ctx.stroke(); }
+
+  }
+
+
+
+  function drawWater(z){
+
+    const s = WATER_STYLES[z.kind]; if (!s) return;
+
+    if (s.grad){ const g = ctx.createLinearGradient(z.x, z.y, z.x, z.y+z.h); g.addColorStop(0, s.grad[0]); g.addColorStop(1, s.grad[1]); ctx.fillStyle = g; }
+
+    else { ctx.fillStyle = s.fill; }
+
+    ctx.fillRect(z.x, z.y, z.w, z.h);
+
+    if (s.stroke){ ctx.strokeStyle = s.stroke; ctx.lineWidth = s.lw || 1; const inset = s.inset||0; ctx.strokeRect(z.x+inset, z.y+inset, z.w-2*inset, z.h-2*inset); }
+
+    if (z.kind!=='pool'){ ctx.strokeStyle = 'rgba(255,255,255,0.06)'; ctx.lineWidth = 1; for (let i=0;i<60;i++){ const x = z.x + 8 + (i*z.w/60); const y = z.y + 8 + (i*z.h/60)%z.h; ctx.beginPath(); ctx.arc(x, y, 10, 0, Math.PI*2); ctx.stroke(); } }
+
+  }
+
+
+
+  function drawStripe(s){
+
+    ctx.save();
+
+    ctx.globalAlpha = 0.25 + 0.25*(s.life/STRIPE_DURATION);
+
+    ctx.fillStyle = '#48a7f5';
+
+    if (s.orient==='v') ctx.fillRect(s.pos-STRIPE_WIDTH/2, 0, STRIPE_WIDTH, WORLD.h);
+
+    else ctx.fillRect(0, s.pos-STRIPE_WIDTH/2, WORLD.w, STRIPE_WIDTH);
+
+    ctx.restore();
+
+  }
+
+
+
+  function drawHouse(hs){
+
+    const base = hs.destroyed ? '#2b120e' : '#2a2f36';
+
+    const roof = hs.destroyed ? '#3d1a12' : '#353c45';
+
+    ctx.fillStyle = base; ctx.fillRect(hs.x, hs.y, hs.w, hs.h);
+
+    ctx.fillStyle = roof; ctx.fillRect(hs.x+6, hs.y+6, hs.w-12, hs.h-12);
+
+
+
+    if (!hs.destroyed && hs.fire>0){
+
+      const c = hs.center();
+
+      const grd = ctx.createRadialGradient(c.x, c.y, 0, c.x, c.y, Math.max(hs.w,hs.h)*0.8);
+
+      grd.addColorStop(0, `rgba(255,160,40,${0.22 + hs.fire/600})`);
+
+      grd.addColorStop(1, 'rgba(255,120,0,0)');
+
+      ctx.fillStyle = grd; ctx.beginPath(); ctx.arc(c.x, c.y, Math.max(hs.w,hs.h)*0.7, 0, Math.PI*2); ctx.fill();
+
+      if (Math.random()<0.18) addSmoke(c.x + (RNG()*2-1)*hs.w*0.2, hs.y+8, 0.5+hs.fire/140);
+
+    }
+
+
+
+    // explosive marker if cold
+
+    if (hs.isExplosive && hs.fire<=0 && !hs.destroyed){
+
+      ctx.fillStyle = '#7c7f85';
+
+      ctx.fillRect(hs.x+hs.w/2-4, hs.y+6, 8, 8);
+
+    }
+
+
+
+    if (hs.destroyed){
+
+      ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 3; ctx.beginPath();
+
+      ctx.moveTo(hs.x+4, hs.y+4); ctx.lineTo(hs.x+hs.w-4, hs.y+hs.h-4);
+
+      ctx.moveTo(hs.x+hs.w-4, hs.y+4); ctx.lineTo(hs.x+4, hs.y+hs.h-4);
+
+      ctx.stroke();
+
+    }
+
+
+
+    // foam outline
+
+    if (hs.foamTimer>0 && !hs.destroyed){
+
+      ctx.strokeStyle = 'rgba(120,200,255,0.7)'; ctx.lineWidth = 2; ctx.strokeRect(hs.x-2, hs.y-2, hs.w+4, hs.h+4);
+
+    }
+
+  }
+
+
+
+  function drawHeli(h){
+
+    ctx.save();
+
+    ctx.translate(h.x, h.y);
+
+    ctx.globalAlpha = 0.3; ctx.fillStyle = '#000'; ctx.beginPath(); ctx.ellipse(0, 14, 18, 7, 0, 0, Math.PI*2); ctx.fill(); ctx.globalAlpha = 1;
+
+
+
+    const tilt = clamp(Math.hypot(h.vx,h.vy)/420, 0, 1)*0.2;
+
+    ctx.rotate(h.angle);
+
+    ctx.fillStyle = '#89b0ff';
+
+    roundedRect(-16, -9, 34, 18, 6); ctx.fill();
+
+    ctx.fillStyle = '#c9d6ff'; ctx.beginPath(); ctx.ellipse(4, 0, 9, 7, 0, 0, Math.PI*2); ctx.fill();
+
+    ctx.fillStyle = '#6d88cc'; ctx.fillRect(-28, -3, 20, 6);
+
+    ctx.save(); ctx.translate(-28, 0); ctx.rotate(h.rotor*1.4);
+
+    ctx.strokeStyle = '#b9c7ff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(-6,0); ctx.lineTo(6,0); ctx.stroke(); ctx.restore();
+
+    ctx.save(); ctx.translate(6, -10 - tilt*4); ctx.rotate(h.rotor);
+
+    ctx.strokeStyle = '#dde6ff'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(-24, 0); ctx.lineTo(24, 0); ctx.stroke(); ctx.restore();
+
+    ctx.restore();
+
+
+
+    // splash preview circle if holding space
+
+    const dropRadius = BASE_DROP_RADIUS * (state?.rainTime>0? 3 : 1);
+
+    if (isDown('Space') && h.water>0){
+
+      ctx.save();
+
+      ctx.globalAlpha = 0.25; ctx.strokeStyle = '#66c4ff'; ctx.lineWidth = 2; ctx.setLineDash([6,6]);
+
+      ctx.beginPath(); ctx.arc(h.x, h.y+10, dropRadius, 0, Math.PI*2); ctx.stroke();
+
+      ctx.restore(); ctx.setLineDash([]);
+
+    }
+
+  }
+
+
+
+  function roundedRect(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y, x+w,y+h, r); ctx.arcTo(x+w,y+h, x,y+h, r); ctx.arcTo(x,y+h, x,y, r); ctx.arcTo(x,y, x+w,y, r); ctx.closePath(); }
+
+
+
+  function stepAndDrawSplashes(){
+
+    for (let i=splashes.length-1; i>=0; i--){ const p=splashes[i]; p.life -= 1/60; p.r += 60/60; if (p.life<=0){ splashes.splice(i,1); continue; }
+
+      ctx.globalAlpha = Math.max(0, p.life);
+
+      ctx.strokeStyle = '#66c4ff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2); ctx.stroke(); ctx.globalAlpha = 1;
+
+    }
+
+    for (let i=ripples.length-1; i>=0; i--){ const p=ripples[i]; p.life -= 1/60; p.r += 30/60; if (p.life<=0){ ripples.splice(i,1); continue; }
+
+      ctx.globalAlpha = Math.max(0, p.life*0.6);
+
+      ctx.strokeStyle = '#7fd0ff'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2); ctx.stroke(); ctx.globalAlpha = 1;
+
+    }
+
+  }
+
+
+
+  function stepAndDrawSmokes(){
+
+    for (let i=smokes.length-1; i>=0; i--){ const p=smokes[i]; p.t += 1/60; const life = p.life; const k = p.t / life; if (k>=1){ smokes.splice(i,1); continue; }
+
+      ctx.globalAlpha = (1-k) * 0.35 * p.s;
+
+      ctx.fillStyle = '#cbd5e1';
+
+      ctx.beginPath(); ctx.arc(p.x, p.y - k*70, p.r*(0.6 + k*0.8), 0, Math.PI*2); ctx.fill(); ctx.globalAlpha = 1;
+
+    }
+
+  }
+
+
+
+  function drawSmokejumper(sj){
+
+    ctx.save();
+
+    ctx.fillStyle = '#ffd15a';
+
+    ctx.strokeStyle = '#996600';
+
+    const c = sj.target.center();
+
+    ctx.beginPath(); ctx.arc(c.x, c.y-10, 4, 0, Math.PI*2); ctx.fill();
+
+    ctx.beginPath(); ctx.moveTo(c.x, c.y-14); ctx.lineTo(c.x, c.y-20); ctx.stroke();
+
+    ctx.restore();
+
+  }
+
+
+
+  function drawThreatIndicator(){
+
+    const screenX = (state.heli.x - camera.x) * DPR;
+
+    const screenY = (state.heli.y - camera.y) * DPR;
+
+    const radius = 60 * DPR;
+
+    const view = { x: camera.x, y: camera.y, w: canvas.width / DPR, h: canvas.height / DPR };
+
+    let count = 0;
+
+    for (const hs of state.houses){
+
+      if (hs.destroyed || hs.fire<=0) continue;
+
+      const off = (hs.x+hs.w < view.x) || (hs.x > view.x+view.w) || (hs.y+hs.h < view.y) || (hs.y > view.y+view.h);
+
+      if (!off) continue;
+
+      const angle = Math.atan2(hs.y - state.heli.y, hs.x - state.heli.x);
+
+      const ix = screenX + Math.cos(angle) * radius;
+
+      const iy = screenY + Math.sin(angle) * radius;
+
+      ctx.save();
+
+      ctx.globalAlpha = Math.max(0.2, Math.min(0.9, 0.4 + (hs.fire/250)));
+
+      ctx.translate(ix, iy); ctx.rotate(angle);
+
+      ctx.fillStyle = '#ff6b4a';
+
+      ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(-6*DPR, 3*DPR); ctx.lineTo(-6*DPR, -3*DPR); ctx.closePath(); ctx.fill();
+
+      ctx.restore();
+
+      if (++count>24) break; // avoid clutter
+
+    }
+
+
+
+    // targeting crosshair (under heli) when active
+
+    if (state.smokejumperTargeting){
+
+      ctx.save();
+
+      ctx.globalAlpha = 0.8; ctx.strokeStyle = '#ffd25a'; ctx.lineWidth = 2;
+
+      ctx.beginPath(); ctx.arc(screenX, screenY, radius*0.7, 0, Math.PI*2); ctx.stroke();
+
+      ctx.beginPath(); ctx.moveTo(screenX-8, screenY); ctx.lineTo(screenX+8, screenY); ctx.moveTo(screenX, screenY-8); ctx.lineTo(screenX, screenY+8); ctx.stroke();
+
+      ctx.restore();
+
+    }
+
+  }
+
+
+
+  function drawBar(y, label, ratio, gradColors, labelColor = '#e7ebef'){
+
+    const barW = 220 * DPR, barH = 18 * DPR;
+
+    ctx.fillStyle = 'rgba(255,255,255,0.09)'; roundRectPath(0, y, barW, barH, 10 * DPR); ctx.fill();
+
+    const fillW = Math.max(0, Math.min(barW - 2 * DPR, (barW - 2 * DPR) * ratio));
+
+    const grad = ctx.createLinearGradient(0, 0, barW, 0); grad.addColorStop(0, gradColors[0]); grad.addColorStop(1, gradColors[1]);
+
+    ctx.fillStyle = grad; roundRectPath(1 * DPR, y + 1 * DPR, fillW, barH - 2 * DPR, 8 * DPR); ctx.fill();
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 1.5; roundRectPath(0, y, barW, barH, 10 * DPR); ctx.stroke();
+
+    ctx.fillStyle = labelColor; ctx.font = `${12 * DPR}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`; ctx.fillText(label, 10 * DPR, y + barH / 2);
+
+  }
+
+
+
+  function drawUI(){
+
+    const pad = 12 * DPR;
+
+    // water tank & boost stamina bar
+
+    ctx.save(); ctx.translate(pad, pad); ctx.textBaseline = 'middle';
+
+    const waterRatio = state.heli.water / MAX_WATER; drawBar(0, 'water', waterRatio, ['#58b6ff', '#1b7bd1']);
+
+    const stamRatio = state.unlocks.boost ? (state.boostStam / BOOST_STAM_MAX) : 0; const stamLabelColor = state.boostLock ? '#ffb4a8' : '#e7ebef';
+
+    drawBar(18 * DPR + 8 * DPR, 'boost', stamRatio, ['#ffd25a', '#ff8a00'], stamLabelColor);
+
+    ctx.restore();
+
+
+
+    // right panel: level & upgrades
+
+    const right = canvas.width - pad;
+
+    const text = `level ${state.level} • saves ${state.savedThisLevel}/${state.target} • lost ${state.destroyed}/${MAX_LOSSES}`;
+
+    ctx.fillStyle = 'rgba(15,20,25,.7)'; roundRectPath(right-420*DPR, pad, 410*DPR, 22*DPR, 10*DPR); ctx.fill();
+
+    ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.lineWidth = 1; roundRectPath(right-420*DPR, pad, 410*DPR, 22*DPR, 10*DPR); ctx.stroke();
+
+    ctx.fillStyle = '#e7ebef'; ctx.font = `${12*DPR}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`; ctx.textAlign='center'; ctx.textBaseline='middle';
+
+    ctx.fillText(text, right-215*DPR, pad+11*DPR);
+
+
+
+    // mini-map
+
+    const mw = 180*DPR, mh = 120*DPR; const mx = right - mw; const my = canvas.height - mh - pad;
+
+    ctx.fillStyle = 'rgba(15,20,25,.7)'; roundRectPath(mx, my, mw, mh, 10*DPR); ctx.fill(); ctx.strokeStyle='rgba(255,255,255,.12)'; ctx.stroke();
+
+    ctx.save(); ctx.beginPath(); roundRectPath(mx+6*DPR, my+6*DPR, mw-12*DPR, mh-12*DPR, 8*DPR); ctx.clip();
+
+    const sx = (mw-12*DPR)/WORLD.w, sy = (mh-12*DPR)/WORLD.h; const ox = mx+6*DPR, oy = my+6*DPR;
+
+    for (const z of state.waterZones){ ctx.fillStyle = (z.kind==='lake')? '#215a7a' : (z.kind==='pond')? '#266d92' : '#4db7e6'; ctx.fillRect(ox+z.x*sx, oy+z.y*sy, Math.max(1,z.w*sx), Math.max(1,z.h*sy)); }
+
+    for (const hs of state.houses){ ctx.fillStyle = hs.destroyed? '#51251c' : (hs.fire>0? '#ff7a2e' : '#90a4b1'); ctx.fillRect(ox+hs.x*sx, oy+hs.y*sy, Math.max(1,hs.w*sx), Math.max(1,hs.h*sy)); }
+
+    ctx.fillStyle = '#bde3ff'; ctx.beginPath(); ctx.arc(ox+state.heli.x*sx, oy+state.heli.y*sy, 3*DPR, 0, Math.PI*2); ctx.fill();
+
+    const vx = ox + camera.x*sx, vy = oy + camera.y*sy, vw = (canvas.width/DPR)*sx, vh = (canvas.height/DPR)*sy;
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1; ctx.strokeRect(vx,vy,vw,vh);
+
+    ctx.restore();
+
+
+
+    // upgrade badges & cooldowns
+
+    const pad2 = pad; const ux = pad2, uy = canvas.height - pad2 - 60*DPR;
+
+    drawUpgradeBadge(ux, uy, 'boost', state.unlocks.boost, state.boostLock? 'cooling' : null, 'shift');
+
+    drawUpgradeBadge(ux+110*DPR, uy, 'planes', state.unlocks.planes, state.planesCd, 'E');
+
+    drawUpgradeBadge(ux+220*DPR, uy, 'cloud', state.unlocks.rain, state.rainCd || 0, 'Q');
+
+    const jText = state.smokejumperTargeting? 'aim' : state.smokejumperCd>0? `cd ${state.smokejumperCd.toFixed(0)}s` : 'ready';
+
+    drawUpgradeBadge(ux+330*DPR, uy, 'jumper', state.unlocks.smokejumpers, jText, 'C');
+
+  }
+
+
+
+  function drawUpgradeBadge(x,y,label,unlocked,cooldown,key){
+
+    const w = 100*DPR, h = 50*DPR;
+
+    ctx.fillStyle = 'rgba(15,20,25,.7)'; roundRectPath(x,y,w,h,10*DPR); ctx.fill(); ctx.strokeStyle='rgba(255,255,255,.12)'; ctx.stroke();
+
+    ctx.fillStyle = unlocked? '#e7ebef' : 'rgba(231,235,239,0.45)';
+
+    ctx.font = `${12*DPR}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
+
+    ctx.fillText(label, x + 10*DPR, y + 16*DPR);
+
+    const line2 = unlocked? (typeof cooldown==='number'? (cooldown>0? `cd ${cooldown.toFixed(0)}s` : 'ready') : cooldown) : 'locked';
+
+    ctx.fillText(line2, x + 10*DPR, y + 32*DPR);
+
+    ctx.fillText(key, x + w - 18*DPR, y + 16*DPR);
+
+  }
+
+
+
+  function roundRectPath(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+
+
+
+  
+
+  function drawScoreboard(sb){
+
+    const W = canvas.width, H = canvas.height, dpr=DPR;
+
+    ctx.setTransform(1,0,0,1,0,0);
+
+    ctx.fillStyle = 'r
