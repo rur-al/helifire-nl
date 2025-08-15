@@ -20,7 +20,9 @@
 
   #help kbd { background: #11161a; padding: 2px 5px; border-radius: 6px; border: 1px solid #2a3239; font-size: 12px; }
 
-  #msg { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); background: rgba(15,20,25,.7); border: 1px solid rgba(255,255,255,.1); border-radius: 10px; padding: 8px 10px; backdrop-filter: blur(6px); font-size: 13px; }
+  #msg { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); background: rgba(15,20,25,.7); border: 1px solid rgba(255,255,255,.1); border-radius: 10px; padding: 8px 10px; backdrop-filter: blur(6px); font-size: 13px; }
+
+  #fps { position: fixed; top: 12px; right: 12px; background: rgba(15,20,25,.7); border: 1px solid rgba(255,255,255,.1); border-radius: 10px; padding: 8px 10px; backdrop-filter: blur(6px); font-size: 12px; display: none; }
 
   canvas { display: block; width: 100vw; height: 100vh; }
 
@@ -52,6 +54,8 @@
 
   <div id="msg"></div>
 
+  <div id="fps"></div>
+
   <div id="help">
 
     fly - <kbd>WASD</kbd> or <kbd>arrows</kbd><br>
@@ -66,7 +70,8 @@
 
     smokejumper - <kbd>C</kbd> (toggle targeting, click a house) — unlocks by level 2<br>
 
-    restart - <kbd>R</kbd> · pause - <kbd>P</kbd>
+    restart - <kbd>R</kbd> · pause - <kbd>P</kbd><br>
+    help - <kbd>H</kbd> · fps - <kbd>F</kbd>
 
   </div>
 
@@ -119,6 +124,14 @@
   const startBtn = document.getElementById('startBtn');
 
   const difficultySelect = document.getElementById('difficulty');
+  const helpEl = document.getElementById('help');
+  const fpsEl = document.getElementById('fps');
+
+  let helpVisible = true;
+  let helpLatch = false;
+  let showFps = false;
+  let fpsLatch = false;
+  let fpsCounter = 0, fpsTime = 0;
 
   let DPR = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
 
@@ -678,6 +691,16 @@
 
     render();
 
+    if (showFps){
+      fpsCounter++;
+      fpsTime += dt;
+      if (fpsTime >= 0.5){
+        fpsEl.textContent = (fpsCounter / fpsTime).toFixed(0) + ' FPS';
+        fpsCounter = 0;
+        fpsTime = 0;
+      }
+    }
+
     requestAnimationFrame(tick);
 
   }
@@ -685,6 +708,14 @@
 
 
   function update(dt){
+
+    if (isDown('KeyH')){
+      if (!helpLatch){ helpLatch = true; helpVisible = !helpVisible; helpEl.style.display = helpVisible ? '' : 'none'; }
+    } else helpLatch = false;
+
+    if (isDown('KeyF')){
+      if (!fpsLatch){ fpsLatch = true; showFps = !showFps; fpsEl.style.display = showFps ? '' : 'none'; }
+    } else fpsLatch = false;
 
     if (!state) { newLevel(1); return; }
 
